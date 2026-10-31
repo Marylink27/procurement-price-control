@@ -1,0 +1,447 @@
+openapi: 3.0.3
+info:
+  title: Портал контроля закупочных цен
+  version: 1.0.0
+  license: { name: MIT }
+  description: |
+    API портала для фронтенда, поставщиков с API-источником и 1С.
+    Авторизация: Bearer JWT. Роль пользователя в токене определяет доступные операции.
+servers:
+  - url: https://portal.example.ru/api/v1
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Импорт
+    description: Загрузка прайс-листов и отчёты об ошибках
+  - name: Сопоставления
+    description: Связь позиций поставщика с каталогом
+  - name: Предложения
+    description: Очередь и решения по новым ценам
+  - name: Справочники
+    description: Каталог, ШК и синхронизация с 1С
+  - name: Выгрузка
+    description: Передача согласованных цен в 1С
+
+paths:
+  /imports:
+    post:
+      tags: [Импорт]
+      operationId: uploadPriceList
+      summary: Загрузить прайс-лист (UC-01)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [source_id, file]
+              properties:
+                source_id: { type: integer, example: 1 }
+                file: { type: string, format: binary, description: "xlsx, xls или csv до 20 МБ" }
+      responses:
+        '202':
+          description: Файл принят, обработка асинхронная
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Import' }
+        '409':
+          description: Этот файл по источнику уже загружали
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { code: DUPLICATE_FILE, message: "Файл уже загружен 01.10.2026 пользователем Иванова А." }
+        '413': { description: Файл больше 20 МБ }
+        '422':
+          description: Источник неактивен или формат файла не поддерживается
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /imports/{id}:
+    get:
+      tags: [Импорт]
+      operationId: getImport
+      summary: Статус и итоги загрузки
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Import' }
+        '404': { description: Не найдено }
+
+  /imports/{id}/errors:
+    get:
+      tags: [Импорт]
+      operationId: listImportErrors
+      summary: Ошибки строк загрузки
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ImportError' }
+
+  /matches/unmatched:
+    get:
+      tags: [Сопоставления]
+      operationId: listUnmatched
+      summary: Позиции без пары с подсказками (UC-02)
+      parameters:
+        - { name: supplier_id, in: query, schema: { type: integer } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        supplier_item: { $ref: '#/components/schemas/SupplierItem' }
+                        suggestions:
+                          type: array
+                          maxItems: 3
+                          items:
+                            type: object
+                            properties:
+                              product: { $ref: '#/components/schemas/Product' }
+                              similarity: { type: number, example: 0.82 }
+                  next_cursor: { type: string, nullable: true }
+
+  /matches:
+    post:
+      tags: [Сопоставления]
+      operationId: createMatch
+      summary: Сопоставить позицию вручную
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [supplier_item_id, product_id]
+              properties:
+                supplier_item_id: { type: integer, example: 3 }
+                product_id: { type: integer, example: 3 }
+                confirm_duplicate:
+                  type: boolean
+                  default: false
+                  description: Подтвердить, если товар уже сопоставлен с другой позицией этого поставщика
+      responses:
+        '201':
+          description: Сопоставление создано, предложения пересчитаны
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Match' }
+        '409':
+          description: Товар уже сопоставлен с другой позицией поставщика
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { code: PRODUCT_ALREADY_MATCHED, message: "Товар Т1-00031001 уже сопоставлен с AZ-GT-680-OLD" }
+
+  /exclusions:
+    post:
+      tags: [Сопоставления]
+      operationId: createExclusion
+      summary: Исключить позицию из обработки
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [supplier_item_id, reason]
+              properties:
+                supplier_item_id: { type: integer }
+                reason: { type: string, minLength: 5 }
+      responses:
+        '201': { description: Позиция исключена }
+
+  /offers:
+    get:
+      tags: [Предложения]
+      operationId: listOffers
+      summary: Очередь предложений (UC-03, UC-04)
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/OfferStatus' }
+          style: form
+          explode: false
+          example: [pending_review]
+        - { name: supplier_id, in: query, schema: { type: integer } }
+        - { name: min_deviation, in: query, schema: { type: number }, description: "Отклонение от, %" }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [-deviation_pct, created_at], default: -deviation_pct }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Offer' }
+                  next_cursor: { type: string, nullable: true }
+
+  /offers/{id}/decision:
+    post:
+      tags: [Предложения]
+      operationId: decideOffer
+      summary: Решение закупщика или руководителя
+      description: |
+        Допустимые переходы: см. статусную модель в docs/05-data-model.md.
+        Закупщик решает по `pending_review`, руководитель по `pending_approval`.
+      parameters: [ { $ref: '#/components/parameters/Id' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [approve, reject] }
+                comment:
+                  type: string
+                  description: Обязателен при reject и при передаче руководителю
+            example: { decision: approve, comment: "Поставщик поднял базовую цену на 12%, аналог дороже" }
+      responses:
+        '200':
+          description: Решение принято
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Offer' }
+        '403': { description: Роль не может решать по предложению в этом статусе }
+        '409':
+          description: Статус уже изменился (решение принял другой пользователь)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Нет обязательного комментария
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { code: COMMENT_REQUIRED, message: "Укажите причину, она уйдёт поставщику" }
+
+  /offers/decisions:
+    post:
+      tags: [Предложения]
+      operationId: decideOffersBulk
+      summary: Массовое решение закупщика по нескольким предложениям
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [offer_ids, decision]
+              properties:
+                offer_ids: { type: array, items: { type: integer }, maxItems: 500 }
+                decision: { type: string, enum: [approve, reject] }
+                comment: { type: string }
+      responses:
+        '200':
+          description: Результат по каждому предложению
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    offer_id: { type: integer }
+                    status: { $ref: '#/components/schemas/OfferStatus' }
+                    error: { type: string, nullable: true }
+
+  /dictionaries/{name}:
+    get:
+      tags: [Справочники]
+      operationId: getDictionary
+      summary: Справочник для клиента с инкрементальной загрузкой (NFR-01)
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string, enum: [product, barcode, supplier_item] }
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+          description: Версия справочника в кэше клиента
+      responses:
+        '200':
+          description: Изменения после версии клиента (или весь справочник, если версии нет)
+          headers:
+            ETag: { schema: { type: string }, description: Текущая версия }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: integer, example: 1550 }
+                  full: { type: boolean, description: "true, если отдан весь справочник" }
+                  upserts: { type: array, items: { type: object } }
+                  deletes: { type: array, items: { type: string } }
+        '304': { description: Справочник не менялся }
+
+  /sync/{name}:
+    put:
+      tags: [Справочники]
+      operationId: syncDictionary
+      summary: Приём изменений справочника из 1С (I-1)
+      security: [ { serviceToken: [] } ]
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string, enum: [product, barcode, supplier] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [since_version, records]
+              properties:
+                since_version: { type: integer }
+                records: { type: array, items: { type: object } }
+      responses:
+        '200':
+          description: Изменения применены
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: integer }
+        '409': { description: "since_version не совпадает с версией портала: нужна полная выгрузка" }
+
+  /exports:
+    post:
+      tags: [Выгрузка]
+      operationId: startExport
+      summary: Запустить выгрузку согласованных цен в 1С вручную (UC-05)
+      responses:
+        '202':
+          description: Пакет создан
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batch_id: { type: integer }
+                  items: { type: integer }
+        '409': { description: Выгрузка уже идёт }
+
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+    serviceToken: { type: apiKey, in: header, name: X-Service-Token }
+
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: integer } }
+    Limit: { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+    Cursor: { name: cursor, in: query, schema: { type: string } }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        details: { type: object, nullable: true }
+
+    OfferStatus:
+      type: string
+      enum: [unmatched, matched, pending_review, pending_approval, approved, rejected, exported, export_failed, excluded]
+
+    Import:
+      type: object
+      properties:
+        id: { type: integer, example: 41 }
+        source_id: { type: integer }
+        file_name: { type: string, example: "Альфа_прайс_октябрь.xlsx" }
+        status: { type: string, enum: [received, failed, processed] }
+        rows_total: { type: integer, nullable: true, example: 120 }
+        rows_error: { type: integer, nullable: true, example: 3 }
+        summary:
+          type: object
+          nullable: true
+          properties:
+            matched: { type: integer, example: 104 }
+            unmatched: { type: integer, example: 13 }
+            auto_approved: { type: integer, example: 88 }
+            pending: { type: integer, example: 16 }
+        created_at: { type: string, format: date-time }
+
+    ImportError:
+      type: object
+      properties:
+        row_num: { type: integer, example: 9 }
+        field: { type: string, example: price }
+        code: { type: string, example: PRICE_NOT_NUMBER }
+        message: { type: string, example: "В колонке «Цена, руб с НДС» значение «по запросу»" }
+
+    Product:
+      type: object
+      properties:
+        id: { type: integer }
+        code_1c: { type: string, example: "Т1-00031001" }
+        name: { type: string, example: "Arizona Green Tea 0,68 л ж/б" }
+        category: { type: string, example: "Напитки" }
+
+    SupplierItem:
+      type: object
+      properties:
+        id: { type: integer }
+        supplier_id: { type: integer }
+        supplier_sku: { type: string, example: "AZ-GT-680" }
+        barcode: { type: string, nullable: true }
+        name: { type: string, example: "ARIZONA GREEN TEA 680ML" }
+
+    Match:
+      type: object
+      properties:
+        id: { type: integer }
+        supplier_item_id: { type: integer }
+        product_id: { type: integer }
+        method: { type: string, enum: [barcode, article, name, manual] }
+        confidence: { type: number }
+        matched_by: { type: string, nullable: true }
+
+    Offer:
+      type: object
+      properties:
+        id: { type: integer, example: 3 }
+        status: { $ref: '#/components/schemas/OfferStatus' }
+        product: { $ref: '#/components/schemas/Product' }
+        supplier_item: { $ref: '#/components/schemas/SupplierItem' }
+        price: { type: number, example: 182.00 }
+        current_price: { type: number, nullable: true, example: 160.00 }
+        deviation_pct: { type: number, nullable: true, example: 13.75 }
+        valid_from: { type: string, format: date }
+        reason: { type: string, nullable: true }
+        requires_head: { type: boolean, description: "Рост выше порога руководителя" }
+        sales_4w_units: { type: integer, nullable: true, description: "Продажи за 4 недели для оценки влияния на маржу" }
